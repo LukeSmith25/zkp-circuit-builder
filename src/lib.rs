@@ -21,10 +21,12 @@ pub struct Builder {
     constraints: Vec<(usize, usize)>,
     /// Set of nodes currently being evaluated (for cycle detection)
     in_progress: std::collections::HashSet<usize>,
+    /// Storage for hint functions and their dependencies
+    hint_functions: Vec<(Box<dyn Fn(&Builder) -> u32>, Vec<usize>)>,
 }
 
 /// Internal representation of a node's data
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct NodeData {
     /// Current value of the node (if computed)
     value: Option<u32>,
@@ -33,7 +35,7 @@ struct NodeData {
 }
 
 /// Defines the possible operations a node can perform
-#[derive(Debug)]
+#[derive(Clone)]
 enum Operation {
     /// An input node that gets its value from user input
     Input,
@@ -43,8 +45,21 @@ enum Operation {
     Add(usize, usize),
     /// Multiplication of two other nodes (by node ID)
     Multiply(usize, usize),
-    /// A hint node with a function to compute its value
-    Hint(Box<dyn Fn(&Builder) -> u32>),
+    /// A hint node with reference to a function in the hint_functions storage
+    Hint(usize),
+}
+
+// Manual implementation of Debug for Operation
+impl std::fmt::Debug for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Operation::Input => write!(f, "Input"),
+            Operation::Constant(val) => write!(f, "Constant({})", val),
+            Operation::Add(a, b) => write!(f, "Add({}, {})", a, b),
+            Operation::Multiply(a, b) => write!(f, "Multiply({}, {})", a, b),
+            Operation::Hint(idx) => write!(f, "Hint(function_idx: {})", idx),
+        }
+    }
 }
 
 /// Errors that can occur during graph operations
@@ -69,6 +84,7 @@ impl Builder {
             nodes: Vec::new(),
             constraints: Vec::new(),
             in_progress: std::collections::HashSet::new(),
+            hint_functions: Vec::new(),
         }
     }
 
@@ -181,84 +197,110 @@ impl Builder {
         // Mark as in-progress for cycle detection
         self.in_progress.insert(node_id);
 
+        // Clone the operation to avoid borrowing issues
+        let operation = self.nodes[node_id].operation.clone();
+
         // Compute value based on operation type
-        match &self.nodes[node_id].operation {
+        match operation {
             Operation::Input => {
                 self.in_progress.remove(&node_id);
                 return Err(GraphError::MissingInput(node_id));
             }
 
             Operation::Constant(val) => {
-                self.nodes[node_id].value = Some(*val);
+                self.nodes[node_id].value = Some(val);
             }
 
-            Operation::Add(a, b) => {
+            Operation::Add(a_id, b_id) => {
                 // Ensure nodes exist
-                if *a >= self.nodes.len() || *b >= self.nodes.len() {
+                if a_id >= self.nodes.len() || b_id >= self.nodes.len() {
                     self.in_progress.remove(&node_id);
                     return Err(GraphError::InvalidNodeReference(
-                        if *a >= self.nodes.len() { *a } else { *b }
+                        if a_id >= self.nodes.len() { a_id } else { b_id }
                     ));
                 }
 
+                // Check if dependencies need to be computed
+                let a_needs_compute = self.nodes[a_id].value.is_none();
+                let b_needs_compute = self.nodes[b_id].value.is_none();
+
                 // Recursively compute dependencies if needed
-                if self.nodes[*a].value.is_none() {
-                    self.compute_node_value(*a)?;
+                if a_needs_compute {
+                    self.compute_node_value(a_id)?;
                 }
-                if self.nodes[*b].value.is_none() {
-                    self.compute_node_value(*b)?;
+
+                if b_needs_compute {
+                    self.compute_node_value(b_id)?;
                 }
 
                 // Get values
-                let a_val = self.nodes[*a].value.ok_or_else(|| {
-                    GraphError::ComputationError(format!("Node {} value not computed", a))
+                let a_val = self.nodes[a_id].value.ok_or_else(|| {
+                    GraphError::ComputationError(format!("Node {} value not computed", a_id))
                 })?;
 
-                let b_val = self.nodes[*b].value.ok_or_else(|| {
-                    GraphError::ComputationError(format!("Node {} value not computed", b))
+                let b_val = self.nodes[b_id].value.ok_or_else(|| {
+                    GraphError::ComputationError(format!("Node {} value not computed", b_id))
                 })?;
 
                 // Compute and store result
                 self.nodes[node_id].value = Some(a_val + b_val);
             }
 
-            Operation::Multiply(a, b) => {
+            Operation::Multiply(a_id, b_id) => {
                 // Ensure nodes exist
-                if *a >= self.nodes.len() || *b >= self.nodes.len() {
+                if a_id >= self.nodes.len() || b_id >= self.nodes.len() {
                     self.in_progress.remove(&node_id);
                     return Err(GraphError::InvalidNodeReference(
-                        if *a >= self.nodes.len() { *a } else { *b }
+                        if a_id >= self.nodes.len() { a_id } else { b_id }
                     ));
                 }
 
+                // Check if dependencies need to be computed
+                let a_needs_compute = self.nodes[a_id].value.is_none();
+                let b_needs_compute = self.nodes[b_id].value.is_none();
+
                 // Recursively compute dependencies if needed
-                if self.nodes[*a].value.is_none() {
-                    self.compute_node_value(*a)?;
+                if a_needs_compute {
+                    self.compute_node_value(a_id)?;
                 }
-                if self.nodes[*b].value.is_none() {
-                    self.compute_node_value(*b)?;
+
+                if b_needs_compute {
+                    self.compute_node_value(b_id)?;
                 }
 
                 // Get values
-                let a_val = self.nodes[*a].value.ok_or_else(|| {
-                    GraphError::ComputationError(format!("Node {} value not computed", a))
+                let a_val = self.nodes[a_id].value.ok_or_else(|| {
+                    GraphError::ComputationError(format!("Node {} value not computed", a_id))
                 })?;
 
-                let b_val = self.nodes[*b].value.ok_or_else(|| {
-                    GraphError::ComputationError(format!("Node {} value not computed", b))
+                let b_val = self.nodes[b_id].value.ok_or_else(|| {
+                    GraphError::ComputationError(format!("Node {} value not computed", b_id))
                 })?;
 
                 // Compute and store result
                 self.nodes[node_id].value = Some(a_val * b_val);
             }
 
-            Operation::Hint(func) => {
-                // Temporarily remove from in-progress to allow hint to access other nodes
+            Operation::Hint(hint_idx) => {
+                // Temporarily remove from in-progress to avoid false cycle detection
                 self.in_progress.remove(&node_id);
+
+                // Get the hint function and dependencies
+                if hint_idx >= self.hint_functions.len() {
+                    return Err(GraphError::InvalidNodeReference(hint_idx));
+                }
+
+                // Compute all dependencies first
+                let dependencies = &self.hint_functions[hint_idx].1;
+                for &dep_id in dependencies {
+                    if self.nodes[dep_id].value.is_none() {
+                        self.compute_node_value(dep_id)?;
+                    }
+                }
 
                 // Call the hint function, catching any panics
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    func(self)
+                    (self.hint_functions[hint_idx].0)(self)
                 }));
 
                 match result {
@@ -274,7 +316,7 @@ impl Builder {
             }
         }
 
-        // Remove from in-progress set
+        // Make sure node is not in the in-progress set
         self.in_progress.remove(&node_id);
 
         Ok(())
@@ -314,11 +356,16 @@ impl Builder {
                     // Increment in-degree for current node
                     *in_degree.get_mut(&node_id).unwrap() += 2;
                 }
-                Operation::Hint(_) => {
-                    // For simplicity, assume hints depend on all previous nodes
-                    for i in 0..node_id {
-                        graph.get_mut(&i).unwrap().push(node_id);
-                        *in_degree.get_mut(&node_id).unwrap() += 1;
+                Operation::Hint(hint_idx) => {
+                    // Use stored dependencies for hints
+                    if *hint_idx < self.hint_functions.len() {
+                        let dependencies = &self.hint_functions[*hint_idx].1;
+                        for &dep_id in dependencies {
+                            if dep_id < self.nodes.len() {
+                                graph.get_mut(&dep_id).unwrap().push(node_id);
+                                *in_degree.get_mut(&node_id).unwrap() += 1;
+                            }
+                        }
                     }
                 }
                 _ => {} // Input and Constant nodes have no dependencies
@@ -410,10 +457,17 @@ impl Builder {
     where
         F: Fn(&Builder) -> u32 + 'static
     {
+        // Store the function and track which nodes it might depend on
+        // For simplicity, we'll track all existing nodes as potential dependencies
+        let dependencies = (0..self.nodes.len()).collect::<Vec<_>>();
+        let hint_idx = self.hint_functions.len();
+        self.hint_functions.push((Box::new(compute_fn), dependencies));
+
+        // Create the node with a reference to the stored function
         let id = self.nodes.len();
         self.nodes.push(NodeData {
             value: None,
-            operation: Operation::Hint(Box::new(compute_fn)),
+            operation: Operation::Hint(hint_idx),
         });
         Node { id }
     }
@@ -546,9 +600,10 @@ mod tests {
         let b = builder.init();
         let c = builder.init();
 
-        // Now create a node that depends on c, then b, then a
-        // This is intentionally out of order from their creation
-        let expr = builder.add(c, builder.add(b, a));
+        // Create intermediate node to avoid multiple mutable borrows
+        let b_plus_a = builder.add(b, a);
+        // Now create a node that depends on c and the intermediate node
+        let expr = builder.add(c, b_plus_a);
 
         // Fill in values
         builder.fill_nodes(&[(a, 1), (b, 2), (c, 3)]).unwrap();
